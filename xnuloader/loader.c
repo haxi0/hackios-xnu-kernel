@@ -513,6 +513,15 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
+/* The port's partitions (struct platform, store): redwood's darwin, its first and last LBA of unit 0 as the GPT has them */
+#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
+#define BLOCK_DARWIN_LAST  30617594ULL
+#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
+#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
+/* the OnePlus 8's userdata (sda23, LBA 4133800..30513146), as its GPT has it (sgdisk --info=23 /dev/block/sda) */
+#define INSTANTNOODLE_USERDATA_TYPE  { 0x1b81e7e6, 0xf50d, 0x419b, { 0xa7, 0x39, 0x2a, 0xee, 0xf8, 0xda, 0x33, 0x35 } }
+#define INSTANTNOODLE_USERDATA_UNIQ  { 0x3c8da6a4, 0x5a87, 0x56fb, { 0xc3, 0xf5, 0x7b, 0xf3, 0x73, 0xf8, 0xfd, 0x8f } }
+
 struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
@@ -525,6 +534,14 @@ struct platform {
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
+	/*
+	 * The port's partition on this device's flash: where the iOS volume lies, and the only one a
+	 * write may reach (block_is_darwin). Its GPT identity, all of it: name, type and unique GUIDs,
+	 * first and last LBA of logical unit 0. store NULL: none (QEMU).
+	 */
+	const char *store;
+	efi_guid store_type, store_uniq;
+	uint64_t store_first, store_last;
 };
 
 static const struct platform platform_qemu_virt = {
@@ -551,6 +568,9 @@ static const struct platform platform_redwood = {
 	 */
 	.small_cores = 0x0f,
 	.fb_base = 0xE1000000,
+	/* darwin: the port's own 20 GiB, carved off the end of Android's userdata (tools/userdata-carve.py) */
+	.store = "darwin", .store_type = BLOCK_DARWIN_TYPE, .store_uniq = BLOCK_DARWIN_UNIQ,
+	.store_first = BLOCK_DARWIN_FIRST, .store_last = BLOCK_DARWIN_LAST,
 };
 
 /*
@@ -564,6 +584,13 @@ static const struct platform platform_instantnoodle = {
 	.cores = 8, .core_shift = 8,
 	.small_cores = 0x0f,
 	.fb_base = 0x9C000000,
+	/*
+	 * Its whole userdata (sda23), which the port took over once Android was gone: no GPT change.
+	 * The layout in it is darwin's (the iOS volume and both cryptexes from block 0, written with
+	 * fastboot; writes from BLOCK_WRITE_FIRST on). Type: Android's userdata GUID as the GPT has it.
+	 */
+	.store = "userdata", .store_type = INSTANTNOODLE_USERDATA_TYPE, .store_uniq = INSTANTNOODLE_USERDATA_UNIQ,
+	.store_first = 4133800, .store_last = 30513146,
 };
 
 /*
@@ -1503,10 +1530,6 @@ ufs_survey(void)
  * same partition, named the same, of the same size, in the same place, on logical unit 0.
  */
 #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
-#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1844,37 +1867,48 @@ block_tables(void)
  * is already in bp->name (ufs_name), in ASCII.
  */
 static int
+same_name(const char *a, const char *b)
+{
+	while (*a != 0 && *a == *b) {
+		a++, b++;
+	}
+	return *a == *b;
+}
+
+static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
-	static const char name[] = "darwin";
-	const char *why = NULL;
+	static const efi_guid none = { 0, 0, 0, { 0 } };
+	const char *name = PLAT->store, *why = NULL;
 
-	for (unsigned i = 0; i < sizeof(name); i++) {
-		if (bp->name[i] != name[i]) {
-			return 0;               /* another partition: nothing to say about it */
-		}
+	if (name == NULL) {
+		return 0;                       /* this device has no partition of the port's */
 	}
-	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
+	if (!same_name(bp->name, name)) {
+		return 0;                       /* another partition: nothing to say about it */
+	}
+	if (memcmp(&PLAT->store_type, &none, sizeof(none)) == 0 || memcmp(&PLAT->store_uniq, &none, sizeof(none)) == 0) {
+		why = "its GUIDs are not known to this loader";
+	} else if (memcmp(&info->type_guid, &PLAT->store_type, sizeof(efi_guid)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+	} else if (memcmp(&info->unique_guid, &PLAT->store_uniq, sizeof(efi_guid)) != 0) {
 		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
+	} else if (info->start_lba != PLAT->store_first || info->end_lba != PLAT->store_last) {
 		why = "it does not begin and end where it did";
 	} else if (bp->unit != 0) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
+	} else if (bp->block_size != 4096 || bp->blocks != PLAT->store_last - PLAT->store_first + 1) {
 		why = "its blocks are not what they were";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
 	}
 	if (why != NULL) {
-		print("ufs: darwin: no write will be served: %s\n", why);
+		print("ufs: %s: no write will be served: %s\n", name, why);
 		return 0;
 	}
-	print("ufs: darwin (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
+	print("ufs: %s (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n", name,
 	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
 	return 1;
 }
@@ -1953,8 +1987,7 @@ block_start(void)
 			block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
-		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
-		    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
+		if (block_probe_requested && PLAT->store != NULL && same_name(bp->name, PLAT->store)) {
 			block_io2_probe(handles[i], bio);
 		}
 	}

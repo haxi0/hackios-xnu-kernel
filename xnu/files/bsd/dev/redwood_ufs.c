@@ -76,8 +76,31 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
  * bounds and the GUIDs of the partition besides (xnuloader/loader.c, BLOCK_WRITE_FIRST).
  */
 #define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
-#define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
-#define UFS_DARWIN_BLOCKS  5242875ULL
+
+/*
+ * The port's partition of each phone (boot-arg board=, which xnuloader passes): its name in the
+ * GPT, its first LBA on unit 0 and its size in blocks of 4096. redwood: darwin, carved off the end
+ * of Android's userdata (tools/userdata-carve.py). OnePlus 8 (instantnoodle): its whole userdata,
+ * which the port took over with Android gone (no GPT change). The layout in it is the same: the
+ * iOS volume and both cryptexes from block 0, writes only from UFS_WRITE_FIRST on. Where the
+ * partition has another name it is also /dev/ufs_darwin and /dev/rufs_darwin, the names user
+ * space knows it by (init's root_apfs=ufs_darwin, var_store). The loader keeps the same identity,
+ * with the partition's GUIDs besides (xnuloader/loader.c, struct platform).
+ */
+static const char *ufs_store_name = "darwin";
+static uint64_t ufs_store_first = 25374720ULL, ufs_store_blocks = 5242875ULL;
+
+static void
+ufs_store_for_board(void)
+{
+	char board[32] = "";
+
+	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "instantnoodle") == 0) {
+		ufs_store_name = "userdata";
+		ufs_store_first = 4133800ULL;           /* LBA 4133800..30513146 of unit 0 (sda23) */
+		ufs_store_blocks = 26379347ULL;
+	}
+}
 
 struct loader_block_part {
 	char name[36];
@@ -1008,7 +1031,7 @@ ufs_bench(__unused void *arg, __unused wait_result_t wr)
 	uint64_t base = 0;
 
 	for (uint32_t i = 0; i < ufs_parts; i++) {
-		if (strcmp((const char *)ufs_page->part[i].name, "darwin") == 0) {
+		if (strcmp((const char *)ufs_page->part[i].name, ufs_store_name) == 0) {
 			part = i;
 		}
 	}
@@ -1073,7 +1096,7 @@ static bool
 ufs_native_map(bool all_units)
 {
 	uint8_t *mine = kalloc_data(4096, Z_WAITOK), *theirs = kalloc_data(BLOCK_MAX_UNITS * 4096, Z_WAITOK);
-	uint32_t units[BLOCK_MAX_UNITS], n = 0, mask = 0, darwin = ufs_entry("darwin");
+	uint32_t units[BLOCK_MAX_UNITS], n = 0, mask = 0, darwin = ufs_entry(ufs_store_name);
 	bool good = mine != NULL && theirs != NULL;
 
 	memset(ufs_lun, 0xff, sizeof(ufs_lun));
@@ -1299,7 +1322,7 @@ ufs_native_check(void)
 		going = ufs_compare(part, 0, 8 << 20, 0, "first 8 MB (geometry, metadata)");
 	}
 	/* darwin: 32 spread megabytes, 256 scattered blocks, 32 pieces that begin and end inside a block */
-	if (going && (part = ufs_entry("darwin")) < BLOCK_MAX_PARTS && ufs_lun[part] != 0xff) {
+	if (going && (part = ufs_entry(ufs_store_name)) < BLOCK_MAX_PARTS && ufs_lun[part] != 0xff) {
 		struct ufs_span s[256];
 		uint64_t bytes = ufs_part_bytes(part), seed = 0x9e3779b97f4a7c15ULL, total = 0;
 
@@ -1369,7 +1392,7 @@ ufs_native_bench(void)
 {
 	static const uint32_t sizes[] = { 4096, 32768, 131072, 524288 };
 	static const uint32_t threads[] = { 1, 2, 4, 8, 16, 31 };
-	uint32_t part = ufs_entry("darwin");
+	uint32_t part = ufs_entry(ufs_store_name);
 
 	if (part >= BLOCK_MAX_PARTS || ufs_lun[part] == 0xff) {
 		printf("ufs: native bench: no darwin\n");
@@ -1445,6 +1468,8 @@ redwood_ufs_init(void)
 	uint32_t check = 0, made = 0;
 	vm_offset_t base;
 
+	ufs_store_for_board();
+
 	if (!PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa)) || pa == 0) {
 		return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
 	}
@@ -1485,6 +1510,12 @@ redwood_ufs_init(void)
 		}
 		snprintf(name, sizeof(name), "rufs_%s", ufs_page->part[i].name);
 		(void)devfs_make_node(makedev(ufs_cmajor, i), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "%s", name);
+		if (strcmp(ufs_store_name, "darwin") != 0 && strcmp((const char *)ufs_page->part[i].name, ufs_store_name) == 0) {
+			/* the port's partition under the name user space knows it by */
+			(void)devfs_make_node(makedev(ufs_bmajor, i), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufs_darwin");
+			(void)devfs_make_node(makedev(ufs_cmajor, i), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufs_darwin");
+			printf("ufs: %s is the port's partition: also /dev/ufs_darwin and /dev/rufs_darwin\n", ufs_store_name);
+		}
 		made++;
 	}
 	ufs_ready = true;
@@ -1507,7 +1538,7 @@ redwood_ufs_init(void)
 		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
 			const char *why = NULL;
 
-			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
+			if (strcmp((const char *)ufs_page->part[i].name, ufs_store_name) != 0) {
 				continue;
 			}
 			if (i != offered - 1) {
@@ -1519,15 +1550,15 @@ redwood_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+			} else if (ufs_page->part[i].start_lba != ufs_store_first) {
 				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+			} else if (ufs_page->part[i].blocks != ufs_store_blocks) {
 				why = "it is not the size it was";
 			} else if (ufs_page->part[i].block_size != 4096) {
 				why = "its blocks are not 4096 bytes";
 			}
 			if (why != NULL) {
-				printf("ufs: darwin: no write will be asked for: %s\n", why);
+				printf("ufs: %s: no write will be asked for: %s\n", ufs_store_name, why);
 				continue;
 			}
 			ufs_write_part = (int)i;
@@ -1535,9 +1566,9 @@ redwood_ufs_init(void)
 		if (ufs_write_part >= 0) {
 			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
 			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+			    (ufs_store_blocks - UFS_WRITE_FIRST) * 4096 >> 20);
 		} else {
-			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
+			printf("ufs: nothing takes writes: %s is not among the partitions\n", ufs_store_name);
 		}
 	}
 

@@ -15,6 +15,9 @@ load_device() {
 	. "$conf"
 	DEVICE=$name
 	export DEVICE KIND
+	# for mkxnuimg.py, also where xl builds the loader's boot image itself (xl enter): this device's,
+	# not redwood's defaults
+	export FD_BASE FD_SIZE PAYLOAD_BASE UEFI_TARGET UEFI_FD DTB
 	echo "${0##*/}: device $DEVICE -- $NAME ($KIND)"
 }
 
