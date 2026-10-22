@@ -130,6 +130,8 @@ stage1() {
 		log "making the SDK: links to $IOS_SDK"
 		rm -rf "$XNU_SDK_PATH"
 		cp -rs "$(cd "$IOS_SDK" && pwd)" "$XNU_SDK_PATH"
+		# a read-only SDK (theos from the Nix store) gives read-only directories: usr/local goes in below
+		find "$XNU_SDK_PATH" -type d -exec chmod u+w {} +
 	fi
 	local sdk_local=$XNU_SDK_PATH/usr/local
 	mkdir -p $sdk_local/include/kernel/os $sdk_local/include/os $sdk_local/lib/kernel $sdk_local/libexec

@@ -1,4 +1,10 @@
 #!/bin/bash
 # BSD-style install wrapper: drop the BSD-only -S (safe copy) flag
 args=(); for a in "$@"; do [ "$a" = "-S" ] || args+=("$a"); done
+# the next install on PATH after this one (/usr/bin/install on most systems)
+HB="$(cd "$(dirname "$0")" && pwd)"
+IFS=: read -ra dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+	[ "$(cd "$d" 2>/dev/null && pwd)" != "$HB" ] && [ -x "$d/install" ] && exec "$d/install" "${args[@]}"
+done
 exec /usr/bin/install "${args[@]}"

@@ -11,6 +11,7 @@
 !/mkxnuimg.py
 !/xnu-build.sh
 !/xnu-env.sh
+!/shell.nix
 !/xnuloader/
 !/qemu/
 !/tools/
