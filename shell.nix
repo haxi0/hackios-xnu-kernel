@@ -13,6 +13,7 @@ pkgs.mkShell {
     flex bison gnum4 perl autoconf automake libtool gnumake xz lz4
     ncurses # tcsh (xnu-deps) needs tgetent()
     libuuid # uuid/uuid.h for the kernel build's host tools (xnu-deps/hostinc/hostcompat.h)
+    nasm acpica-tools # Mu-Silicium (uefi/README.md): nasm in place of mu_nasm, iasl for ACPI
   ];
   # the loader is freestanding and the kernel is Mach-O: no glibc hardening flags
   hardeningDisable = [ "all" ];
