@@ -554,12 +554,26 @@ static const struct platform platform_redwood = {
 };
 
 /*
+ * OnePlus 8 (instantnoodle, SM8250): GIC and cores from its device tree (common/new-device.sh);
+ * cores 0-3 are Cortex-A55s, 4-6 Cortex-A77s, 7 the faster A77; the framebuffer is the ABL's
+ * continuous splash ("Display Reserved" in the kona UEFI memory map), 1080 x 2400.
+ */
+static const struct platform platform_instantnoodle = {
+	.name = "instantnoodle", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	.small_cores = 0x0f,
+	.fb_base = 0x9C000000,
+};
+
+/*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_instantnoodle,
 };
 
 /* ------------------------------------------------------------------------ */
