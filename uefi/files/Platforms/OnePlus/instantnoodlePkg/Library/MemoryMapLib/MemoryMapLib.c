@@ -25,6 +25,9 @@ gMemoryDescriptor[] = {
   {"Info Blk",         0x9FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
   {"Kernel",           0xA0000000, 0x10000000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
   {"DXE Heap",         0xB0000000, 0x04500000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
+  /* HackiOS: the XNU loader's container, copied here by the boot shim (BootShim.S, XnuLoader.h);
+     Android's /proc/iomem shows plain RAM here (its CMA pools only) */
+  {"XNU Payload",      0xF0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
 
   // Other Memory Regions
   {"IMEM Base",        0x14680000, 0x00040000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},
