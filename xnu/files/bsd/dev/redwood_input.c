@@ -217,6 +217,7 @@ redwood_input_init(void)
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
 	redwood_goodix_init();
+	instantnoodle_touch_init();     /* the OnePlus 8's S6SY761 (board=instantnoodle) */
 	redwood_buttons_init();
 	redwood_battery_init();
 	redwood_ufs_init();

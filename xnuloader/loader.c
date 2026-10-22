@@ -2986,6 +2986,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	for (const char *c = base_cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;
 	}
+	/* board=NAME: which device this is, for the kernel's drivers of one device (redwood_buttons.c...) */
+	for (const char *c = "board="; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+		ba->commandLine[n++] = *c;
+	}
+	for (const char *c = PLAT->name; *c && n < BOOT_LINE_LENGTH - 2; c++) {
+		ba->commandLine[n++] = *c;
+	}
+	ba->commandLine[n++] = ' ';
 	/* one processor unless the payload asks for more (of two "cpus=" the kernel takes the first) */
 	if (!more_cores) {
 		for (const char *c = "cpus=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
