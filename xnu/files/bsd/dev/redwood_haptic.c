@@ -54,6 +54,7 @@
 #include <pexpert/pexpert.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
+#include <sys/instantnoodle.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <sys/redwood_audio.h>
@@ -124,27 +125,56 @@ wait_ms(uint32_t ms)
 
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
-#define TLMM_PHYS               0x0f100000UL
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-#define PIN_SDA                 36      /* the serial engine's first pin is the data line, the second the clock */
-#define PIN_SCL                 37
-#define PIN_RESET               35
-#define PIN_INT                 18
+/*
+ * The pins of each phone (boot-arg board=, which xnuloader passes): redwood's by default. The OnePlus 8's
+ * AW8697 (Android's live device tree: i2c@a8c000, serial engine 11, pins gpio60 data / gpio61 clock,
+ * reset gpio72; its interrupt, gpio118, is on another tile and is not looked at): the SOUTH tile.
+ */
+static struct {
+	uint64_t tlmm;                  /* the TLMM tile all of them are on */
+	unsigned sda, scl, reset, irq;  /* the serial engine's first pin is the data line, the second the clock */
+} board = { 0x0f100000UL, 36, 37, 35, 18 };
+static bool aw8697;                     /* the chip is the OnePlus 8's AW8697 (not redwood's AW86927) */
+/*
+ * The AW8697 is in standby: its under-voltage flag means nothing then (the boost is off) and OnePlus's driver
+ * masks it for exactly that time (SYSINTM [5]); it is not taken for a fault while this is set.
+ */
+static bool a7_asleep;
+
+#define TLMM_PHYS               board.tlmm
+#define PIN_SDA                 board.sda
+#define PIN_SCL                 board.scl
+#define PIN_RESET               board.reset
+#define PIN_INT                 board.irq
+
+static void
+board_setup(void)
+{
+	if (instantnoodle_board()) {
+		board.tlmm = INSTANTNOODLE_TLMM_SOUTH;
+		board.sda = 60;
+		board.scl = 61;
+		board.reset = 72;
+		board.irq = 0;
+		aw8697 = true;
+	}
+}
 
 static void
 show_pins(void)
 {
-	static const struct {
+	const struct {
 		unsigned pin;
 		const char *what;
 	} pins[] = { { PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { PIN_RESET, "reset" }, { PIN_INT, "interrupt" } };
 
-	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]) && pins[i].pin != 0; i++) {
 		uint32_t cfg = rd(GPIO_CFG(pins[i].pin)), io = rd(GPIO_IO(pins[i].pin));
 
 		say("haptic: gpio%u (%s): function %u, pull %u, %u mA, %s, reads %u\n", pins[i].pin, pins[i].what, (cfg >> 2) & 15,
@@ -345,7 +375,44 @@ regs_write(uint8_t reg, const uint8_t *values, unsigned count)
 #define AW_CHIPIDL              0x58
 #define AW_CHIPID               0x9270
 
+/*
+ * The OnePlus 8's AW8697 (chip ID 0x97), Awinic's older chip: OnePlus's driver drivers/oneplus/vibrator/aw8697.c
+ * and aw8697_reg.h (android_kernel_oneplus_sm8250). Its interrupt flags are at the same place with the same
+ * meaning (SYSINT_FAULTS below), and the RAM's address and data ports too (0x40, 0x41, 0x42).
+ */
+#define A7_ID                   0x00            /* 0x97; 0xaa written: a soft reset */
+#define A7_CHIPID               0x97
+#define A7_SYSINTM              0x03            /* [5] under-voltage masked */
+#define A7_SYSCTRL              0x04            /* [5] the RAM open, [3:2] play mode (0 RAM), [1] boost, [0] standby */
+#define A7_GO                   0x05            /* [0] */
+#define A7_WAVSEQ1              0x07            /* the first waveform to play, then the next ... (0: the end) */
+#define A7_WAVSEQ2              0x08
+#define A7_WAVLOOP1             0x0f            /* [7:4] how often the first is repeated, 15: until told to stop */
+#define A7_BASE_ADDRH           0x21
+#define A7_BASE_ADDRL           0x22
+#define A7_FIFO_AEH             0x23            /* .. 0x26: the FIFO's almost-empty and almost-full thresholds */
+#define A7_PWMPRC               0x2d
+#define A7_PWMDBG               0x2e
+#define A7_BSTCFG               0x34
+#define A7_ANADBG               0x35
+#define A7_DATDBG               0x39            /* the gain */
+#define A7_BSTDBG4              0x3a            /* [5:1] the boost's voltage */
+#define A7_PRLVL                0x3e
+#define A7_GLB_STATE            0x46            /* [3:0] the state: 0 standby */
+#define A7_BST_AUTO             0x47
+#define A7_DETCTRL              0x5f            /* [5] protection: no action, [0] a measurement goes (clears when done) */
+#define A7_ADCTEST              0x66            /* [6] battery voltage compensation by the chip */
+#define A7_GAIN                 0x80            /* OnePlus's driver: aw8697_haptic_set_gain(0x80) */
+#define A7_LOOP_WAVEFORM        10              /* what OnePlus's driver repeats for a vibration of some length */
+/*
+ * The waveform file for its motor: OnePlus's driver picks one of five by the f0 the factory measured (166 to
+ * 174 Hz), which is not known here; 170 Hz is the motor's nominal (AW8697_HAPTIC_F0_PRE).
+ */
+#define A7_WAVEFORMS            "aw8697_haptic_170.bin"
+
 #define SYSINT_FAULTS           0xe6            /* boost short circuit and over-voltage, under-voltage, over-current, over-temperature */
+/* the AW8697's: the same less its boost error (0x80), which OnePlus's driver masks and never acts on */
+#define A7_FAULTS               0x66
 #define HAPTIC_MAX_MS           1000
 
 static void
@@ -394,9 +461,33 @@ put(uint8_t reg, uint8_t value)
 	return true;
 }
 
+/* Only the bits of `mask' changed, as the drivers' masked writes do; each write read back. */
+static bool
+put_bits(uint8_t reg, uint8_t mask, uint8_t value)
+{
+	uint8_t now = 0;
+
+	if (!get(reg, &now)) {
+		give_up("a register could not be read");
+		return false;
+	}
+	return (now & mask) == (value & mask) || put(reg, (uint8_t)((now & ~mask) | (value & mask)));
+}
+
+/* A register that changes by itself (a "go" bit): written, not read back. */
+static bool
+poke(uint8_t reg, uint8_t value)
+{
+	if (broken || !regs_write(reg, &value, 1)) {
+		give_up("a write was not acknowledged");
+		return false;
+	}
+	return true;
+}
+
 /* The chip's interrupt flags (reading clears them): false, and the chip given up on, if one is a fault. */
 static bool
-healthy(const char *when)
+flags_ok(const char *when, uint8_t ignore)
 {
 	uint8_t flags = 0;
 
@@ -404,7 +495,7 @@ healthy(const char *when)
 		give_up("the flags could not be read");
 		return false;
 	}
-	if (flags & SYSINT_FAULTS) {
+	if (flags & (aw8697 ? A7_FAULTS : SYSINT_FAULTS) & ~ignore) {
 		say("haptic: %s: the chip reports %#04x:%s%s%s%s%s\n", when, flags, flags & 0x80 ? " BOOST SHORT CIRCUIT" : "",
 		    flags & 0x40 ? " BOOST OVER-VOLTAGE" : "", flags & 0x20 ? " UNDER-VOLTAGE" : "", flags & 0x04 ? " OVER-CURRENT" : "",
 		    flags & 0x02 ? " OVER-TEMPERATURE" : "");
@@ -412,6 +503,12 @@ healthy(const char *when)
 		return false;
 	}
 	return true;
+}
+
+static bool
+healthy(const char *when)
+{
+	return flags_ok(when, aw8697 && a7_asleep ? 0x20 : 0);
 }
 
 /* Android's registers as its driver leaves them, read from the phone's sysfs (fw-haptic/android/haptic-sysfs.txt) */
@@ -433,6 +530,29 @@ static void
 show_registers(void)
 {
 	unsigned differ = 0;
+
+	if (aw8697) {
+		/* (no record of Android's here: the registers as they are; 0x06 and 0x42 are data ports, not read) */
+		for (unsigned base = 0; base < 0x80; base += 16) {
+			char line[100];
+			int n = snprintf(line, sizeof(line), "haptic: %#04x:", base);
+
+			for (unsigned reg = base; reg < base + 16; reg++) {
+				uint8_t value = 0;
+
+				if (reg == 0x06 || reg == 0x42) {
+					n += snprintf(line + n, sizeof(line) - (size_t)n, " --");
+				} else if (!regs_read((uint8_t)reg, &value, 1)) {
+					say("haptic: %#04x NOT READ\n", reg);
+					return;
+				} else {
+					n += snprintf(line + n, sizeof(line) - (size_t)n, " %02x", value);
+				}
+			}
+			say("%s\n", line);
+		}
+		return;
+	}
 
 	for (unsigned reg = 0; reg <= 0x7c; reg++) {
 		uint8_t value = 0;
@@ -456,6 +576,16 @@ static bool
 chip_answers(void)
 {
 	uint8_t id[2] = { 0, 0 };
+
+	if (aw8697) {
+		if (!regs_read(A7_ID, id, 1)) {
+			say("haptic: nobody answers at %#x on the bus of gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
+			return false;
+		}
+		say("haptic: the chip at %#x is %#04x%s\n", AW_ADDRESS, id[0], id[0] == A7_CHIPID ? ", an AW8697" :
+		    ": NOT THE AW8697 EXPECTED");
+		return id[0] == A7_CHIPID;
+	}
 
 	if (!regs_read(AW_CHIPIDH, id, 2)) {
 		say("haptic: nobody answers at %#x on the bus of gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
@@ -510,9 +640,56 @@ unlock(bool open)
 	return true;
 }
 
+/*
+ * OnePlus's configuration, as its driver's aw8697_haptic_init() makes it outside the factory mode, in its
+ * order: the boost's voltage 0x11, the gain 0x80, standby, 24 kHz waveforms, the boost's debug registers,
+ * the current limits (4.65 A, 150 ns; the boost's peak 4 A: OnePlus's AW8697_DEFAULT_PEAKCUR), the motor
+ * protection and the automatic boost off, the offset calibration (a measurement with the RAM open),
+ * battery-voltage compensation by the chip, the second waveform slot cleared. Not written: the trigger
+ * pins' setup (its device tree gives none: their reset values), the f0 trim (its factory value is not known
+ * here: the reset value stays).
+ */
+static bool a7_sleep(void);
+
+static bool
+configure_aw8697(void)
+{
+	uint8_t det = 1, stale = 0;
+
+	/* (the flags latched before anybody looked: under-voltage from its power-up, 0x31 as the phone came) */
+	if (!get(AW_SYSINT, &stale)) {
+		give_up("the flags could not be read");
+		return false;
+	}
+	say("haptic: OnePlus's configuration is written (the flags from before, now cleared: %#04x)\n", stale);
+	if (!put_bits(A7_BSTDBG4, 0x3e, 0x11 << 1) || !put(A7_DATDBG, A7_GAIN) || !a7_sleep() ||
+	    !put_bits(A7_PWMDBG, 0x60, 0x40) ||
+	    !put(0x31, 0x30) || !put(0x32, 0xeb) || !put(0x33, 0xd4) || !put(0x4d, 0x12) || !put(0x5d, 0x68) ||
+	    !put_bits(A7_ANADBG, 0x0f, 0x0f) || !put_bits(A7_BSTCFG, 0x07, 0x07) ||
+	    !put_bits(A7_DETCTRL, 0x20, 0x20) || !put_bits(A7_PWMPRC, 0x80, 0x00) || !put_bits(A7_PRLVL, 0x80, 0x00) ||
+	    !put_bits(A7_BST_AUTO, 0x04, 0x00)) {
+		return false;
+	}
+	if (!put_bits(A7_SYSCTRL, 0x20, 0x20) || !get(A7_DETCTRL, &det) || !poke(A7_DETCTRL, det | 0x01)) {
+		return false;
+	}
+	for (unsigned i = 0; i < 2000 && (det & 0x01); i++) {
+		if (!get(A7_DETCTRL, &det)) {
+			give_up("the offset calibration could not be watched");
+			return false;
+		}
+	}
+	say("haptic: the offset calibration %s\n", (det & 0x01) ? "DID NOT FINISH" : "is done");
+	return put_bits(A7_SYSCTRL, 0x20, 0x00) && put_bits(A7_ADCTEST, 0x40, 0x40) && put(A7_WAVSEQ2, 0x00) &&
+	       healthy("after the configuration");
+}
+
 static bool
 configure(void)
 {
+	if (aw8697) {
+		return configure_aw8697();
+	}
 	say("haptic: Android's configuration is written\n");
 	for (unsigned i = 0; i < sizeof(android_config) / sizeof(android_config[0]); i++) {
 		if (!put(android_config[i][0], android_config[i][1])) {
@@ -541,7 +718,7 @@ wait_standby(unsigned ms)
 	for (unsigned waited = 0; waited <= ms; waited += 2) {
 		uint8_t state = 0xff;
 
-		if (!get(AW_GLBRD5, &state)) {
+		if (!get(aw8697 ? A7_GLB_STATE : AW_GLBRD5, &state)) {
 			return false;
 		}
 		states_seen |= 1u << (state & 0x0f);
@@ -563,12 +740,13 @@ static bool
 load_waveforms(void)
 {
 	uint64_t size = 0;
-	const uint8_t *file = redwood_wifi_file("aw8697_haptic.bin", &size);
+	const char *name = aw8697 ? A7_WAVEFORMS : "aw8697_haptic.bin";
+	const uint8_t *file = redwood_wifi_file(name, &size);
 	uint32_t sum = 0, base, length;
 	uint8_t address[2], back[64];
 
 	if (file == NULL || size < 8) {
-		say("haptic: no aw8697_haptic.bin in fw/ of the small image (fw-haptic/ when it is built)\n");
+		say("haptic: no %s in fw/ of the small image (fw-haptic/ when it is built)\n", name);
 		return false;
 	}
 	for (uint64_t i = 2; i < size; i++) {
@@ -582,13 +760,24 @@ load_waveforms(void)
 	length = (uint32_t)size - 4;
 	say("haptic: Android's waveforms: %u bytes from %#x on, %u waveforms\n", length, base, (unsigned)(((file[5] << 8 | file[6]) -
 	    base - 1) / 4));
-	if (!wait_standby(250) || !put(AW_SYSCTRL3, (uint8_t)(android_regs[AW_SYSCTRL3] | 0x04))) {
+	if (!wait_standby(250) || !(aw8697 ? put_bits(A7_SYSCTRL, 0x20, 0x20) :
+	    put(AW_SYSCTRL3, (uint8_t)(android_regs[AW_SYSCTRL3] | 0x04)))) {
 		give_up("the RAM could not be opened");
 		return false;
 	}
 	address[0] = (uint8_t)(base >> 8);
 	address[1] = (uint8_t)base;
-	if (!put(AW_BASEADDRH, address[0]) || !put(AW_BASEADDRL, address[1]) || !regs_write(AW_RAMADDRH, address, 2)) {
+	if (aw8697) {
+		/* (and the FIFO's thresholds from the base, as OnePlus's aw8697_container_update(): a half, three quarters) */
+		uint32_t ae = base >> 1, af = base - (base >> 2);
+
+		if (!put(A7_BASE_ADDRH, address[0]) || !put(A7_BASE_ADDRL, address[1]) || !put(A7_FIFO_AEH, (uint8_t)(ae >> 8)) ||
+		    !put(A7_FIFO_AEH + 1, (uint8_t)ae) || !put(A7_FIFO_AEH + 2, (uint8_t)(af >> 8)) ||
+		    !put(A7_FIFO_AEH + 3, (uint8_t)af) || !regs_write(AW_RAMADDRH, address, 2)) {
+			give_up("the RAM's address could not be set");
+			return false;
+		}
+	} else if (!put(AW_BASEADDRH, address[0]) || !put(AW_BASEADDRL, address[1]) || !regs_write(AW_RAMADDRH, address, 2)) {
 		give_up("the RAM's address could not be set");
 		return false;
 	}
@@ -613,11 +802,61 @@ load_waveforms(void)
 			return false;
 		}
 	}
-	if (!put(AW_SYSCTRL3, android_regs[AW_SYSCTRL3])) {
+	if (!(aw8697 ? put_bits(A7_SYSCTRL, 0x20, 0x00) : put(AW_SYSCTRL3, android_regs[AW_SYSCTRL3]))) {
 		return false;
 	}
-	say("haptic: Android's waveforms are in the chip's RAM and read back as written\n");
+	say("haptic: Android's waveforms (%s) are in the chip's RAM and read back as written\n", name);
 	return healthy("after the waveforms");
+}
+
+/*
+ * The AW8697: a waveform started (OnePlus's aw8697_haptic_play_mode() and _start()): the waveform in the
+ * first slot, the second cleared, repeated or not; the gain; RAM mode, the boost bypassed, the chip made
+ * active, its flags read (cleared), under-voltage unmasked; for a single waveform the boost then on (RAM
+ * mode), for one repeated not (OnePlus's RAM loop mode leaves it bypassed); 2 ms; go.
+ */
+static bool
+a7_start(unsigned waveform, bool forever, uint8_t gain)
+{
+	if (!put(A7_WAVSEQ1, (uint8_t)waveform) || !put(A7_WAVSEQ2, 0x00) || !put_bits(A7_WAVLOOP1, 0xf0, forever ? 0xf0 : 0x00) ||
+	    !put(A7_DATDBG, gain) || !put_bits(A7_SYSCTRL, 0x0f, 0x00)) {
+		return false;
+	}
+	/*
+	 * (OnePlus's aw8697_interrupt_clear(): what the flags gathered since the last waveform, read away and never
+	 * judged by OnePlus; its under-voltage is no fault here either, the others are)
+	 */
+	if (!flags_ok("before playing", 0x20)) {
+		return false;
+	}
+	a7_asleep = false;
+	if (!put_bits(A7_SYSINTM, 0x20, 0x00) || (!forever && !put_bits(A7_SYSCTRL, 0x02, 0x02))) {
+		return false;
+	}
+	wait_ms(2);
+	return poke(A7_GO, 0x01);
+}
+
+/* ... and back to standby (OnePlus's aw8697_haptic_play_mode(STANDBY)): under-voltage masked, the chip asleep. */
+static bool
+a7_sleep(void)
+{
+	if (!put_bits(A7_SYSINTM, 0x20, 0x20) || !put_bits(A7_SYSCTRL, 0x01, 0x01)) {
+		return false;
+	}
+	a7_asleep = true;
+	return true;
+}
+
+/* ... stopped (OnePlus's aw8697_haptic_stop()): go cleared, its state awaited (120 ms at most), asleep. */
+static bool
+a7_stop(void)
+{
+	if (!poke(A7_GO, 0x00) || !wait_standby(120)) {
+		give_up("it does not stop");
+		return false;
+	}
+	return a7_sleep();
 }
 
 /* One waveform played once (Android's effect `effect' - 1), stopped at HAPTIC_MAX_MS at the latest. */
@@ -627,12 +866,16 @@ play_effect(unsigned effect)
 	uint64_t began = mach_absolute_time(), ended;
 	bool done;
 
-	say("haptic: waveform %u is played once, at Android's gain %#x\n", effect, android_regs[AW_PLAYCFG2]);
-	if (!wait_standby(250) || !put(AW_PLAYCFG3, 0x04) || !put(AW_WAVCFG1, (uint8_t)effect) || !put(AW_WAVCFG2, 0x00) ||
+	say("haptic: waveform %u is played once, at Android's gain %#x\n", effect, aw8697 ? A7_GAIN : android_regs[AW_PLAYCFG2]);
+	if (aw8697) {
+		if (!wait_standby(250) || !a7_start(effect, false, A7_GAIN)) {
+			return false;
+		}
+	} else if (!wait_standby(250) || !put(AW_PLAYCFG3, 0x04) || !put(AW_WAVCFG1, (uint8_t)effect) || !put(AW_WAVCFG2, 0x00) ||
 	    !put(AW_WAVCFG9, 0x00) || !put(AW_PLAYCFG2, android_regs[AW_PLAYCFG2]) || !healthy("before playing")) {
 		return false;
 	}
-	{
+	if (!aw8697) {
 		uint8_t go = 0x01;
 
 		if (!regs_write(AW_PLAYCFG4, &go, 1)) {
@@ -647,11 +890,19 @@ play_effect(unsigned effect)
 		uint8_t stop = 0x02;
 
 		say("haptic: STILL PLAYING after %u ms: stopped\n", HAPTIC_MAX_MS);
-		(void)regs_write(AW_PLAYCFG4, &stop, 1);
-		if (!wait_standby(50)) {
-			give_up("it does not stop");
-			return false;
+		if (aw8697) {
+			if (!a7_stop()) {
+				return false;
+			}
+		} else {
+			(void)regs_write(AW_PLAYCFG4, &stop, 1);
+			if (!wait_standby(50)) {
+				give_up("it does not stop");
+				return false;
+			}
 		}
+	} else if (aw8697 && !a7_sleep()) {
+		return false;
 	}
 	say("haptic: the waveform has played: back in standby after %llu ms (states seen meanwhile: %#x, a bit each; 0 is "
 	    "standby)\n", ended / NSEC_PER_MSEC, states_seen);
@@ -768,6 +1019,9 @@ start_waveform(unsigned waveform, bool forever, uint8_t gain)
 {
 	uint8_t go = 0x01;
 
+	if (aw8697) {
+		return a7_start(waveform, forever, gain);
+	}
 	if (!put(AW_PLAYCFG3, 0x04) || !put(AW_WAVCFG1, (uint8_t)waveform) || !put(AW_WAVCFG2, 0x00) ||
 	    !put(AW_WAVCFG9, forever ? 0xf0 : 0x00) || !put(AW_PLAYCFG2, gain)) {
 		return false;
@@ -784,6 +1038,9 @@ stop_waveform(void)
 {
 	uint8_t stop = 0x02;
 
+	if (aw8697) {
+		return a7_stop();
+	}
 	if (!regs_write(AW_PLAYCFG4, &stop, 1) || !wait_standby(50)) {
 		give_up("it does not stop");
 		return false;
@@ -797,7 +1054,7 @@ chip_state(void)
 {
 	uint8_t state = 0xff;
 
-	return get(AW_GLBRD5, &state) ? state & 0x0f : 0xff;
+	return get(aw8697 ? A7_GLB_STATE : AW_GLBRD5, &state) ? state & 0x0f : 0xff;
 }
 
 /*
@@ -811,7 +1068,7 @@ chip_state(void)
 static uint8_t
 gain_for(uint32_t peak)
 {
-	uint32_t top = android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
+	uint32_t top = aw8697 ? A7_GAIN : android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
 
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
 }
@@ -868,7 +1125,7 @@ serve(void)
 				break;
 			}
 			if (active && quiet_us < tap_onset && now - since > TAP_US) {
-				if (stop_waveform() && start_waveform(11, true, gain ? gain : 1)) {
+				if (stop_waveform() && start_waveform(aw8697 ? A7_LOOP_WAVEFORM : 11, true, gain ? gain : 1)) {
 					state = LOOP;
 					since = followed = now;
 					playing_gain = gain ? gain : 1;
@@ -877,13 +1134,13 @@ serve(void)
 					heard_peak = 0;
 					if (taps + loops <= TOLD_EVENTS) {
 						wait_ms(4);
-						say("haptic: vibration %u: iOS goes on playing (peak %u): Android's waveform 11 over and over at "
-						    "gain %#04x, %u ms at most; the chip's state %u\n", loops, peak, gain ? gain : 1,
+						say("haptic: vibration %u: iOS goes on playing (peak %u): Android's waveform %u over and over at "
+						    "gain %#04x, %u ms at most; the chip's state %u\n", loops, peak, aw8697 ? A7_LOOP_WAVEFORM : 11, gain ? gain : 1,
 						    HAPTIC_MAX_MS, chip_state());
 					}
 				}
 			} else if (!active && now - since > TAP_US) {
-				state = wait_standby(0) || stop_waveform() ? IDLE : state;
+				state = (wait_standby(0) || stop_waveform()) && (!aw8697 || a7_sleep()) ? IDLE : state;
 			}
 			break;
 		case LOOP:
@@ -892,7 +1149,7 @@ serve(void)
 				followed = now;
 				heard_peak = 0;
 				if (peak != 0 && (gain > playing_gain + 8 || gain + 8 < playing_gain)) {
-					if (!put(AW_PLAYCFG2, gain)) {
+					if (!put(aw8697 ? A7_DATDBG : AW_PLAYCFG2, gain)) {
 						break;
 					}
 					playing_gain = gain;
@@ -937,6 +1194,7 @@ serve(void)
 static void
 haptic_thread(__unused void *parameter, __unused wait_result_t result)
 {
+	board_setup();
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	say("haptic: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the reset released, registers read" :
 	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : level == 4 ? "one effect played" :

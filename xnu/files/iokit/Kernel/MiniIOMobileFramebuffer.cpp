@@ -1600,11 +1600,21 @@ publishAccelerator(IOService * provider)
 	gAcceleratorTakesProperties = PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0;
 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
 		accelerator->setName("sgx");
+		/*
+		 * metal=2: the service carries the two properties from the start, as Apple's own
+		 * accelerators do, so that every process -- the first daemons included -- finds the
+		 * Metal device (userland/src/redwoodmetal.m) without bin/metal_props having run.
+		 */
+		if (metal == 2) {
+			accelerator->setProperty(kAcceleratorPluginNameKey, "RedwoodMetal");
+			accelerator->setProperty(kAcceleratorPluginClassNameKey, "RedwoodMetalDevice");
+		}
 		accelerator->registerService();
 		/* the first line to look for in the log of such a boot: the gate is open, nothing is set yet */
 		if (gAcceleratorTakesProperties) {
 			IOLog("IOAcceleratorES: metal=%u: this service takes " kAcceleratorPluginNameKey
-			    " and " kAcceleratorPluginClassNameKey " from user space\n", metal);
+			    " and " kAcceleratorPluginClassNameKey " from user space%s\n", metal,
+			    metal == 2 ? ", and carries RedwoodMetal from the start" : "");
 		}
 	}
 	OSSafeReleaseNULL(accelerator);

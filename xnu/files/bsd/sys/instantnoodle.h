@@ -1,0 +1,47 @@
+/*
+ * What the OnePlus 8 (instantnoodle, SM8250) drivers share: the board check, the TLMM pins and
+ * I2C done on two of them by hand (bsd/dev/instantnoodle_i2c.c).
+ */
+#ifndef _SYS_INSTANTNOODLE_H_
+#define _SYS_INSTANTNOODLE_H_
+
+#include <stdbool.h>
+#include <stdint.h>
+
+/* The three tiles of the SM8250 TLMM (Linux pinctrl-sm8250.c); a pin's registers are 0x1000 * pin into its tile. */
+#define INSTANTNOODLE_TLMM_WEST         0x0f100000UL
+#define INSTANTNOODLE_TLMM_SOUTH        0x0f500000UL
+#define INSTANTNOODLE_TLMM_NORTH        0x0f900000UL
+
+bool instantnoodle_board(void);         /* boot-arg board=instantnoodle (xnuloader passes it) */
+
+struct instantnoodle_pin {
+	uint64_t tile;                  /* INSTANTNOODLE_TLMM_* */
+	unsigned pin;
+};
+#define INSTANTNOODLE_PULL_NONE         0
+#define INSTANTNOODLE_PULL_DOWN         1
+#define INSTANTNOODLE_PULL_UP           3
+uint32_t instantnoodle_gpio_cfg(struct instantnoodle_pin p);       /* the pin's configuration register as it is */
+void instantnoodle_gpio_input(struct instantnoodle_pin p, unsigned pull);
+void instantnoodle_gpio_output(struct instantnoodle_pin p, bool high, unsigned pull, unsigned ma);
+bool instantnoodle_gpio_level(struct instantnoodle_pin p);
+
+/*
+ * An I2C bus driven on its two pins (open drain: low = output 0, high = input, the board's
+ * pull-ups, or the pins' own, make the level), about 100 kHz. The SoC's serial engines are not used: their FIFO
+ * mode is off on this phone and the DMA mode needs GPI. One transfer at a time, on all the buses.
+ */
+struct instantnoodle_i2c {
+	const char *name;
+	struct instantnoodle_pin sda, scl;
+	unsigned pull;                  /* INSTANTNOODLE_PULL_UP where the board has no pull-ups of its own */
+	unsigned errors;                /* transfers that were not acknowledged */
+};
+int instantnoodle_i2c_write(struct instantnoodle_i2c *bus, uint8_t addr, const uint8_t *bytes, unsigned n);
+int instantnoodle_i2c_read(struct instantnoodle_i2c *bus, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n);
+void instantnoodle_i2c_recover(struct instantnoodle_i2c *bus);     /* nine clocks and a stop: a target holding SDA lets go */
+
+void instantnoodle_battery_init(void);  /* the bq27541 fuel gauge (bsd/dev/instantnoodle_battery.c) */
+
+#endif /* _SYS_INSTANTNOODLE_H_ */

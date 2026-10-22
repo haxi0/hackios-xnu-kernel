@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..a11a05faab25 100644
+index 44274016a4cf..97f1e887e67e 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,40 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -74,6 +74,8 @@ index 44274016a4cf..a11a05faab25 100644
 +bsd/dev/redwood_goodix.c	standard
 +bsd/dev/redwood_buttons.c	standard
 +bsd/dev/instantnoodle_touch.c	standard
++bsd/dev/instantnoodle_i2c.c	standard
++bsd/dev/instantnoodle_battery.c	standard
 +bsd/dev/redwood_battery.c	standard
 +bsd/dev/redwood_ufs.c	standard
 +bsd/dev/redwood_ufshc.c	standard
@@ -104,7 +106,7 @@ index 44274016a4cf..a11a05faab25 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +187,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +189,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -119,7 +121,7 @@ index 44274016a4cf..a11a05faab25 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +403,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -127,7 +129,7 @@ index 44274016a4cf..a11a05faab25 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +426,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -136,7 +138,7 @@ index 44274016a4cf..a11a05faab25 100644
  bsd/kern/kern_control.c			optional networking
  bsd/kern/kern_exec.c			standard
 diff --git a/bsd/dev/arm/km.c b/bsd/dev/arm/km.c
-index fd7a94b20794..69eaceedd248 100644
+index fd7a94b20794..354c22752747 100644
 --- a/bsd/dev/arm/km.c
 +++ b/bsd/dev/arm/km.c
 @@ -205,6 +205,15 @@ kmioctl(dev_t dev, u_long cmd, caddr_t data, int flag, proc_t p)
@@ -165,12 +167,60 @@ index fd7a94b20794..69eaceedd248 100644
  int
  kmputc(__unused dev_t dev, char c)
  {
-@@ -363,6 +375,8 @@ kmoutput(struct tty * tp)
+@@ -340,6 +352,47 @@ kmtimeout(void *arg)
+  *		of sizeof(buf) charatcers at a time before dropping into
+  *		the timeout code).
+  */
++/*
++ * What user space writes to /dev/console also goes to the loader's log -- except, with boot-arg
++ * log_launchd=0, launchd's own lines ("com.apple.xpc.launchd|..."): with every daemon of iOS
++ * available on demand they are half of a session's lines, and the loader keeps only the first
++ * 256 KB and the last 1 MB of a log, so they push out what a test wrote. The screen keeps them.
++ * Called under the tty's lock: the state is the console's one line being written.
++ */
++static void
++loader_log_console(char c)
++{
++	static const char launchd[] = "com.apple.xpc.launchd|";
++	static char held[sizeof(launchd)];
++	static unsigned at;                     /* characters of this line so far that match launchd's prefix */
++	static bool passing, dropping;          /* this line is going to the log / is launchd's */
++	static int quiet = -1;
++
++	if (quiet < 0) {
++		uint32_t log_launchd = 1;
++
++		PE_parse_boot_argn("log_launchd", &log_launchd, sizeof(log_launchd));
++		quiet = log_launchd == 0;
++	}
++	if (!quiet || passing) {
++		loader_log_putc(c);
++	} else if (!dropping) {
++		held[at++] = c;
++		if (c != launchd[at - 1]) {
++			for (unsigned i = 0; i < at; i++) {
++				loader_log_putc(held[i]);
++			}
++			passing = true;
++		} else if (at == sizeof(launchd) - 1) {
++			dropping = true;
++		}
++	}
++	if (c == '\n') {
++		at = 0;
++		passing = dropping = false;
++	}
++}
++
+ static int
+ kmoutput(struct tty * tp)
+ {
+@@ -363,6 +416,8 @@ kmoutput(struct tty * tp)
  		for (cp = buf; cp < &buf[cc]; cp++) {
  			/* output the buffer one charatcer at a time */
  			*cp = *cp & 0x7f;
 +			/* What user space writes to /dev/console also goes to the loader's log. */
-+			loader_log_putc((char)*cp);
++			loader_log_console((char)*cp);
  		}
  		if (cc > 1) {
  			console_write((char *)buf, cc);

@@ -96,6 +96,7 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <sys/instantnoodle.h>
 #include <sys/redwood_input.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
@@ -106,6 +107,15 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
+/*
+ * The OnePlus 8 (instantnoodle, SM8250 "kona", boot-arg board=): an Adreno 650 (dt: qcom,kgsl-3d0 chipid
+ * 0x06050002, firmware a650_*). SM8250 is where SC7280's GPU block comes from: the GPU, GMU, RSCC, PDC,
+ * SMMU, GBIF and CX_MISC are at the same addresses, and so are the GPU's clocks in the global clock
+ * controller (OnePlus's gcc-kona.c). What differs is said where it is (kona ? ... : ...), from OnePlus's
+ * android_kernel_oneplus_sm8250 (gpucc-kona.c, debugcc-kona.c) and the phone's live device tree.
+ */
+static bool kona;
+#define FW(name)                (kona ? "a650_" name : "a660_" name)    /* the phone's firmware files in fw/ */
 static uint32_t step;                   /* the one being performed */
 static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
@@ -435,6 +445,15 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (kona) {
+		/* dt: qfprom@780000 (reg 0x784000, the corrected copy) gpu_speed_bin@19b, one byte (kgsl: bits 7:5) */
+		announce("read the GPU's speed bin fuse in the error-corrected copy (0x784000 + 0x19b)");
+		bin = get8(&qfprom, "speed bin", QFPROM_CORRECTED + 0x19b);
+		speed_bin = bin >> 5 & 7;
+		printf("adreno: %u: speed bin %u (byte %#x): an Adreno 650\n", step, speed_bin, bin);
+		return true;
+	}
+
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -476,7 +495,7 @@ static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_HUB_RCGR          0x117c          /* gpu_cc_hub_clk_src */
 #define GPUCC_HUB_CX_INT_CBCR   0x1204          /* gpu_cc_hub_cx_int_clk */
 #define GPUCC_CX_HW_CTRL        0x1540          /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
-#define GPUCC_GX_DOMAIN_MISC    0x158c          /* dt: gpu_gx_domain_addr */
+#define GPUCC_GX_DOMAIN_MISC    (kona ? 0x1508u : 0x158cu)      /* dt: gpu_gx_domain_addr (kona: syscon@3d91508) */
 #define GPUCC_SMMU_VOTE_CBCR    0x5000          /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
 
 #define GDSC_SW_COLLAPSE        (1u << 0)       /* a power switch's control register (gdsc.c): off, by software */
@@ -506,16 +525,20 @@ step_gpucc(void)
 	get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
 	get(&gpucc, "gmu_clk_src command", GPUCC_GMU_RCGR);
 	get(&gpucc, "gmu_clk_src source", GPUCC_GMU_RCGR + 4);
-	get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
-	get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
+	if (!kona) {                    /* (kona has no "hub" clocks and no cb clock) */
+		get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
+		get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
+	}
 	get(&gpucc, "cxo_aon", GPUCC_CXO_AON_CBCR);
 	get(&gpucc, "gx_gmu", GPUCC_GX_GMU_CBCR);
 	get(&gpucc, "ahb", GPUCC_AHB_CBCR);
 	get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	get(&gpucc, "cxo", GPUCC_CXO_CBCR);
-	get(&gpucc, "cb", GPUCC_CB_CBCR);
-	get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
-	get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
+	if (!kona) {
+		get(&gpucc, "cb", GPUCC_CB_CBCR);
+		get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
+		get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
+	}
 	get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
 	return true;
 }
@@ -667,18 +690,20 @@ step_clocks(void)
 		return false;
 	}
 
-	announce("in the GPU's clock controller: the GMU's clock to 200 MHz, the hub's to 150 MHz");
+	/* (kona: gpucc-kona.c, gmu_clk_src 200 MHz from P_GPLL0_OUT_MAIN_DIV = source 6, divider 1.5, as SC7280) */
+	announce(kona ? "in the GPU's clock controller: the GMU's clock to 200 MHz" :
+	    "in the GPU's clock controller: the GMU's clock to 200 MHz, the hub's to 150 MHz");
 	if (!clock_source("gmu_clk_src", GPUCC_GMU_RCGR, RCG_GPLL0_DIV(3)) ||       /* 300 MHz / 1.5 */
-	    !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4))) {       /* 300 MHz / 2 */
+	    (!kona && !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4)))) {       /* 300 MHz / 2 */
 		return false;
 	}
 
 	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
-	if (!clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) ||
+	if ((!kona && !clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false)) ||
 	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
 	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
-	    !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) ||
-	    !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true) ||
+	    (!kona && !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true)) ||
+	    (!kona && !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true)) ||
 	    !clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
 	    !clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false)) {
 		return false;
@@ -696,10 +721,10 @@ step_clocks(void)
  * clk-debug.c (mainline Linux has no counterpart).
  */
 #define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
-#define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
+#define GCC_DEBUG_MUX_GPUCC     (kona ? 0x163u : 0x146u)        /* ... the debug output of the GPU's clock controller */
 #define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
 #define GCC_DEBUG_CBCR          0x62008
-#define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
+#define GCC_XO_DIV4_CBCR        (kona ? 0x4300cu : 0x6200cu)    /* the counter's time base: the crystal / 4, 4.8 MHz (kona: debugcc-kona.c) */
 #define GCC_MEASURE_CTL         0x62038         /* [19:0] how many ticks of the time base to count for */
 #define MEASURE_RUN             (1u << 20)
 #define MEASURE_CLEAR           (1u << 21)
@@ -711,12 +736,13 @@ step_clocks(void)
 #define GPUCC_DEBUG_DIV         0x10fc
 #define GPUCC_DEBUG_CBCR        0x1100
 #define GPUCC_DEBUG_MUX         0x1568          /* [7:0] which of the GPU's clocks */
-#define GPUCC_DEBUG_CXO_AON     0x0b
-#define GPUCC_DEBUG_GX_GFX3D    0x0d            /* the 3D core's own clock */
-#define GPUCC_DEBUG_GX_GMU      0x11
-#define GPUCC_DEBUG_AHB         0x12
-#define GPUCC_DEBUG_CX_GMU      0x1a
-#define GPUCC_DEBUG_CXO         0x1b
+/* (kona's: debugcc-kona.c, gpu_cc_debug_mux_sels) */
+#define GPUCC_DEBUG_CXO_AON     (kona ? 0x0au : 0x0bu)
+#define GPUCC_DEBUG_GX_GFX3D    (kona ? 0x0bu : 0x0du)          /* the 3D core's own clock */
+#define GPUCC_DEBUG_GX_GMU      (kona ? 0x0fu : 0x11u)
+#define GPUCC_DEBUG_AHB         (kona ? 0x10u : 0x12u)
+#define GPUCC_DEBUG_CX_GMU      (kona ? 0x18u : 0x1au)
+#define GPUCC_DEBUG_CXO         (kona ? 0x19u : 0x1bu)
 #define GPUCC_DEBUG_HUB_CX_INT  0x1c
 #define GPUCC_DEBUG_CB          0x26
 #define GPUCC_DEBUG_HUB_AON     0x27
@@ -800,14 +826,19 @@ measure_quietly(uint32_t select)
 static bool
 measure_clocks(void)
 {
-	static const struct {
+	const struct {
 		const char *name;
 		uint32_t select;
-	} clocks[] = {
+	} all[] = {
 		{ "cx_gmu (200 MHz was asked for)", GPUCC_DEBUG_CX_GMU }, { "hub_cx_int (from 150 MHz)", GPUCC_DEBUG_HUB_CX_INT },
 		{ "hub_aon", GPUCC_DEBUG_HUB_AON }, { "cb", GPUCC_DEBUG_CB }, { "cxo_aon", GPUCC_DEBUG_CXO_AON },
 		{ "gx_gmu (should be off)", GPUCC_DEBUG_GX_GMU }, { "ahb, THE ONE IN QUESTION,", GPUCC_DEBUG_AHB },
+	}, sm8250[] = {
+		{ "cx_gmu (200 MHz was asked for)", GPUCC_DEBUG_CX_GMU }, { "cxo_aon", GPUCC_DEBUG_CXO_AON },
+		{ "gx_gmu (should be off)", GPUCC_DEBUG_GX_GMU }, { "ahb, THE ONE IN QUESTION,", GPUCC_DEBUG_AHB },
 	};
+	const __typeof__(all[0]) *clocks = kona ? sm8250 : all;
+	unsigned count = kona ? sizeof(sm8250) / sizeof(sm8250[0]) : sizeof(all) / sizeof(all[0]);
 	uint32_t hz, ahb_hz = MEASURE_FAILED;
 
 	announce("measure the GPU block's clocks with the SoC's frequency counter (debug registers at gcc 0x162000.., "
@@ -822,7 +853,7 @@ measure_clocks(void)
 		printf("adreno: %u: the counter does not show the crystal's rate: nothing it says can be used\n", step);
 		return false;
 	}
-	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+	for (unsigned i = 0; i < count; i++) {
 		hz = measure_quietly(clocks[i].select);
 		if (hz == MEASURE_FAILED) {
 			printf("adreno: %u: measured: %s: the counter did not finish\n", step, clocks[i].name);
@@ -1185,6 +1216,15 @@ step_gmu_memory(void)
 #define SMMU_S2CR_FAULT         (2u << 16)
 #define SMMU_SMR_VALID          (1u << 31)
 #define SMMU_STREAM_MASK        0x400           /* dt: the second cell of every "iommus" of this SMMU */
+/*
+ * ... but kona's tree gives the 3D core one entry for its streams 0 and 1 (gfx3d_user: 0x0 0x401), and
+ * the hypervisor there grants an entry only as the tree has it (0x400 for stream 0 reads back 0)
+ */
+static uint32_t
+stream_mask(uint32_t stream)
+{
+	return kona && stream == 0 ? 0x401 : SMMU_STREAM_MASK;
+}
 #define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* our tables alone decide; weakest defaults */
 #define SMMU_CBA2R(n)           (0x800 + 4 * (n))                       /* in the second page, like CBAR */
 #define SMMU_CBA2R_64_BIT       1
@@ -1415,8 +1455,8 @@ static bool
 space_stream(struct gpu_space *space, uint32_t match, uint32_t stream)
 {
 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | stream_mask(stream) << 16 | stream);
+	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | stream_mask(stream) << 16 | stream) ||
 	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context) {
 		printf("adreno: %u: the SMMU did not take what was written: stream %u is not going through context %u\n", step,
 		    stream, space->context);
@@ -1456,10 +1496,10 @@ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
 	}
 	put(&smmu, "cb sctlr", context + SMMU_CB_SCTLR, SMMU_SCTLR_ON | space->control);
 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
+	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | stream_mask(stream) << 16 | stream);
 
 	/* the global ones are the hypervisor's to grant: see what it made of them */
-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | stream_mask(stream) << 16 | stream) ||
 	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context ||
 	    (get(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
 	    !(get(&smmu, "cb sctlr", context + SMMU_CB_SCTLR) & 1) ||
@@ -1648,7 +1688,7 @@ zap_header(uint64_t *phys)
 	uint64_t size = 0;
 	uint32_t segments, hashes;
 
-	header = image_file("fw", "a660_zap.mdt", &size);
+	header = image_file("fw", FW("zap.mdt"), &size);
 	if (header == NULL) {
 		return false;
 	}
@@ -1682,7 +1722,8 @@ step_zap_signature(void)
 	uint64_t header = 0, answer = ~0ull;
 	int32_t result;
 
-	announce("find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
+	announce(kona ? "find the zap shader's header, fw/a650_zap.mdt, in the small image that came with the kernel" :
+	    "find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
 	if (!zap_header(&header)) {
 		return false;
 	}
@@ -1743,8 +1784,9 @@ step_gmu_space(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("find the GMU's firmware, fw/a660_gmu.bin, in the small image, and make the memory it asks for");
-	gmu_firmware = image_file("fw", "a660_gmu.bin", &gmu_firmware_size);
+	announce(kona ? "find the GMU's firmware, fw/a650_gmu.bin, in the small image, and make the memory it asks for" :
+	    "find the GMU's firmware, fw/a660_gmu.bin, in the small image, and make the memory it asks for");
+	gmu_firmware = image_file("fw", FW("gmu.bin"), &gmu_firmware_size);
 	if (gmu_firmware == NULL) {
 		return false;
 	}
@@ -1875,7 +1917,8 @@ step_gmu_firmware(void)
 #define GMU_RSCC_CONTROL_REQ    GMU_WORD(0x9307)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
-#define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+/* dt qcom,chipid the way the firmware wants it (core, major, minor, patch in 31:24, 23:16, 15:12, 11:8): kona 0x06050002 */
+#define GMU_CHIP                (kona ? 0x06050200u : 0x06035000u)
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
@@ -2284,7 +2327,10 @@ step_core_power(void)
 {
 	static const struct {
 		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	} yupik[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } },
+	/* kona: the three lowest of OnePlus's kona-v2-gpu.dtsi, 305 MHz LOW_SVS, 400 MHz SVS, 525 MHz SVS_L2 */
+	  sm8250[] = { { 0, 0 }, { 305000, 64 }, { 400000, 128 }, { 525000, 224 } };
+	const __typeof__(yupik[0]) *speeds = kona ? sm8250 : yupik;
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
@@ -2299,7 +2345,7 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = sizeof(yupik) / sizeof(yupik[0]);       /* (as many in either) */
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -2319,7 +2365,7 @@ step_core_power(void)
 
 	bw.levels = 1;
 	bw.ddr_commands = 3;
-	bw.ddr_wait = 7;
+	bw.ddr_wait = kona ? 1 : 7;                     /* (Linux: a650_build_bw_table waits on the first command only) */
 	bw.ddr_address[0] = rpmh_resource("SH0", NULL, NULL);
 	bw.ddr_address[1] = rpmh_resource("MC0", NULL, NULL);
 	bw.ddr_address[2] = rpmh_resource("ACV", NULL, NULL);
@@ -2557,14 +2603,15 @@ step_core_space(void)
 {
 	const uint8_t *microcode;
 	uint64_t size = 0;
-	uint32_t stream1 = 1;
+	uint32_t stream1 = kona ? 0 : 1;        /* (kona: stream 1 comes with stream 0's entry) */
 
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
 	PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
-	announce("make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
-	microcode = image_file("fw", "a660_sqe.fw", &size);
+	announce(kona ? "make the 3D core's memory: its ring, its microcode (fw/a650_sqe.fw), a page to try writing to" :
+	    "make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
+	microcode = image_file("fw", FW("sqe.fw"), &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
 	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
@@ -2620,7 +2667,7 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8b71a000ull
+#define ZAP_MEMORY              (kona ? 0x8c51a000ull : 0x8b71a000ull)  /* kona dt: pil_gpu_region@8c51a000, 0x2000 */
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
@@ -2648,7 +2695,7 @@ step_zap_load(void)
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "a660_zap.b02", &size);
+	segment = image_file("fw", FW("zap.b02"), &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
@@ -2694,6 +2741,9 @@ step_zap_load(void)
 
 /* ---- step 20: the 3D core's registers, its command processor started, its first command ------------------- */
 
+#define HIGHEST_BANK_BIT        (kona ? 16u : 14u)
+#define HBB_LO                  ((HIGHEST_BANK_BIT - 13) & 3)   /* (and its high bit, 0 for both) */
+
 static bool
 step_core_start(void)
 {
@@ -2726,25 +2776,30 @@ step_core_start(void)
 	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
 	put(&gpu, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, 0x02000140);
 	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
-	put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	if (!kona) {                    /* (Linux: the A660 family's alone) */
+		put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	}
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
-	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
+	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, kona ? 0x00300200 : 0x00200200);  /* (Linux: A650's, 7c3's) */
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
 	/*
 	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory (Linux's
 	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
 	 * rest as below); Mesa is told the same (redwood_gpu_parameter()).
 	 */
-	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
-	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
-	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
-	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
+	/* (kona: highest bank bit 16, dt qcom,highest-bank-bit: hbb - 13 = 3 in the same fields) */
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | HBB_LO << 1);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), HBB_LO << 1);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | HBB_LO << 1);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), HBB_LO << 21);
 	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
 	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
-	put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
-	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	if (!kona) {                    /* (Linux, kgsl: the A660 family's alone) */
+		put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
+		put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	}
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
 	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, 0x04100000);     /* Mesa's value for this GPU */
 	/*
@@ -3170,7 +3225,7 @@ redwood_adreno_quiesce(void)
  * (redwood_gpu_recover() below, which says what is done and which source says so). Without it
  * such a submission is only reported, and the GPU stays stopped.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
+#define GPU_CHIP_ID             (kona ? 0x06050002ull : 0x06030500ull)  /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3345,8 +3400,8 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x11:                              /* RAYTRACING */
 		*value = 0;
 		return true;
-	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+	case 0x02:                              /* GMEM_SIZE (Linux's adreno_device.c: A650 1 MB + 128 KB) */
+		*value = kona ? 1024 * 1024 + 128 * 1024 : 512 * 1024;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
@@ -3361,7 +3416,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = HIGHEST_BANK_BIT;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
@@ -3988,7 +4043,7 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	const char *const files[] = { FW("gmu.bin"), FW("sqe.fw"), FW("zap.mdt"), FW("zap.b02") };
 	const char *missing = NULL;
 	uint64_t size;
 
@@ -4027,6 +4082,13 @@ redwood_adreno_init(void)
 	};
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
+
+	kona = instantnoodle_board();
+	if (kona) {
+		/* dt: qcom,gmu@3d6a000 0x30000 long; kgsl-smmu@3da0000 0x10000 (eight pages of 4K, by its ID registers) */
+		gmu.size = 0x30000;
+		smmu.size = 0x10000;
+	}
 
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();

@@ -51,6 +51,7 @@ int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
 void redwood_spmi_lock(void);
 void redwood_spmi_unlock(void);
+int redwood_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count); /* id: slave << 8 | peripheral */
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/redwood_adsp.c, with adsp=1):
  * handed to bsd/dev/redwood_battery.c, which keeps it for the sysctls kern.redwood.battery_* and

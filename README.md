@@ -117,6 +117,45 @@ XL_SECS=900 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8 gpu=1 wifi=1 ad
 
 `./xl` with no arguments lists every command (logs, screen and sound recording, camera frames, stop, state...).
 
+## On the phone (OnePlus 8)
+
+The OnePlus 8 (`instantnoodle`, Snapdragon 865 / SM8250) is the second phone: profile `common/devices/instantnoodle.conf`,
+UEFI `uefi/files/Platforms/OnePlus/instantnoodlePkg`, loader platform `platform_instantnoodle`. Its root is the iOS
+volume written to its `userdata` (`tools/store-image.py`; the loader boots `flashboot.apfs` with
+`ufs=2 root_apfs=ufs_darwin`), so unlike redwood this port does write that one partition, once, when it is set up.
+
+What has been seen working on the phone itself (the kernel's log of a run says each of these):
+
+| Works | How | Not yet |
+|---|---|---|
+| Boot to SpringBoard, 8 cores, prime core at 2.84 GHz | `cpus=8 cpufreq=1 bootcpu=7` | Metal for apps (as on redwood) |
+| Touch screen (Samsung S6SY761) and the keys | `board=instantnoodle` (the loader passes it) | Wi-Fi (QCA6390 on PCIe, not redwood's WCN6750) |
+| Battery: level, voltage, current, charging (TI bq27541 gauge, PM8150B USB input) | on with `board=instantnoodle` | Sound (TFA9894 amplifiers, WCD938x codec) |
+| Haptics from iOS (Awinic AW8697): system feedback, CoreHaptics | `haptic=5`, `fw-haptic` | Cameras, sensors, Bluetooth |
+| Flashlight from iOS (PM8150L flash LED, both LEDs) | `torch=3` | Charging control (it charges as the boot chain set it up) |
+| Adreno 650 drawing for CoreAnimation (Mesa/freedreno, OpenGL ES) | `gpu=1`, `fw-gpu`, images with `GL=1` | |
+
+Run `xl enter` with the profile loaded (`common/run.sh instantnoodle`, or `. common/lib.sh; load_device
+instantnoodle` first): a bare `./xl enter` builds redwood's UEFI, which hangs this phone on its fastboot logo
+(then `fastboot reboot bootloader` clears it).
+
+The firmware comes out of the phone's own vendor partition (here a backup of `vendor_a`; from a running Android
+`adb pull /vendor/firmware/...` does the same):
+
+```sh
+7z e vendor_a.img 'firmware/aw8697_haptic*.bin' -ofw-haptic       # haptics (aw8697_haptic_170.bin is used)
+7z e vendor_a.img 'firmware/a650_*' -ofw-gpu                       # GPU (gpu=1)
+tools/mk-mesa.sh                                                   # Mesa, once (needs meson, ninja)
+GL=1 REST=1 FLASHBOOT=1 CRYPTEXES=flash userland/build.sh          # root.apfs + flashboot.apfs
+./xl enter && ./xl ramdisk userland/flashboot.apfs
+XL_SECS=900 XL_CMDLINE="cpus=8 cpufreq=1 bootcpu=7 ufs=2 root_apfs=ufs_darwin haptic=5 torch=3 gpu=1" ./xl run
+```
+
+Boot-args for the GPU and Metal work: `metal=1` lets the Metal driver serve test programs (`RC_JOBS=rc.jobs.metaldefer`
+runs the blits, every fragment shader and the timings); `metal=2 metal_profile=1` hands it the whole system;
+`metal_sync=1` makes every draw wait for its own fence again (slower, but a GPU failure names the draw);
+`log_launchd=0` keeps launchd's lines out of the log that comes back, so long test output survives.
+
 ## Prebuilt boot image
 
 Every release has `hackios-redwood-boot.img` attached: the redwood UEFI with our loader inside, ready for

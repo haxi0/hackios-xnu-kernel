@@ -48,6 +48,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 
@@ -263,6 +264,74 @@ find_channel(struct peripheral *p, uint32_t channels)
 	if (!p->found) {
 		printf("buttons: no channel of the arbiter is %s (slave %u, peripheral %#x)\n", p->name, p->id >> 8, p->id & 0xff);
 	}
+}
+
+/*
+ * A read for another driver (sys/redwood_input.h): any peripheral of any slave, `id` as above,
+ * 1 to 8 registers. Its channel is looked up once (the first one in the table: reads go through
+ * our system's observer, whoever may write). The arbiter is mapped here too, so that it does not
+ * matter whether the buttons' thread has run. 0, or ENXIO / EIO.
+ * shortcut: the lookup table is not locked, one calling thread only (the battery's); lock it for a second caller.
+ */
+int
+redwood_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count)
+{
+	static struct peripheral known[8];
+	static vm_offset_t core, observer;
+	struct peripheral *p = NULL;
+
+	if (count == 0 || count > 8) {
+		return EINVAL;
+	}
+	if (observer == 0) {
+		core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+		if (rd(core + ARB_VERSION) < ARB_VERSION_5 || rd(core + ARB_VERSION) >= ARB_VERSION_7) {
+			return ENXIO;
+		}
+		observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	}
+	for (unsigned i = 0; i < 8 && p == NULL; i++) {
+		if (known[i].found && known[i].id == id) {
+			p = &known[i];
+		} else if (!known[i].found) {
+			for (uint32_t n = 0; n < ARB_MAX_CHANNELS; n++) {
+				if (((rd(core + ARB_CHANNEL(n)) >> 8) & 0xfff) == id) {
+					known[i].id = id;
+					known[i].channel = (uint16_t)n;
+					known[i].found = true;
+					p = &known[i];
+					break;
+				}
+			}
+			if (p == NULL) {
+				return ENXIO;
+			}
+		}
+	}
+	if (p == NULL) {
+		return ENXIO;
+	}
+
+	vm_offset_t channel = observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	uint64_t start = mach_absolute_time(), interval;
+	uint32_t status, data[2];
+
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	redwood_spmi_lock();
+	wr(channel + OBSERVER_COMMAND, COMMAND_READ | (uint32_t)reg << 4 | (count - 1));
+	do {
+		status = rd(channel + OBSERVER_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	data[0] = rd(channel + OBSERVER_DATA0);
+	data[1] = count > 4 ? rd(channel + OBSERVER_DATA1) : 0;
+	redwood_spmi_unlock();
+	if (status != STATUS_DONE) {
+		return EIO;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		bytes[i] = (uint8_t)(data[i / 4] >> (8 * (i % 4)));
+	}
+	return 0;
 }
 
 /* ---- the two peripherals ------------------------------------------------------------------------- */

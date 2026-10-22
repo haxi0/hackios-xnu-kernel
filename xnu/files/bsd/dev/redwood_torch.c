@@ -56,6 +56,7 @@
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/conf.h>
+#include <sys/instantnoodle.h>
 #include <sys/redwood_audio.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
@@ -189,8 +190,7 @@ struct peripheral {
 	bool            found, writable;
 	vm_offset_t     write;          /* its write channel, mapped (only the flash module's) */
 };
-static struct peripheral flash = { .name = "the PM8350C's flash LED module", .id = 0x2ee };
-static struct peripheral alarm = { .name = "the PM8350C's temperature alarm", .id = 0x20a };
+static struct peripheral flash, alarm;         /* named and numbered from `hw' (torch_thread) */
 
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
 static uint8_t alarm_subtype;
@@ -295,14 +295,78 @@ spmi_read_once(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t
 #define ALARM_SUBTYPE           0x05            /* 0x08: the first generation, 0x09 the second */
 #define ALARM_STATUS            0x08            /* the over-temperature stage: [1:0] (first generation) or [6:4] */
 
-#define ANDROID_TORCH_MA        125             /* led:torch_0 while Android's flashlight is on */
-#define IRES_UA                 12500           /* its resolution ("qcom,ires-ua") */
-#define ANDROID_ITARGET         9               /* round(125000 / 12500) - 1: the most ever written */
+#define IRES_UA                 12500           /* the current's resolution ("qcom,ires-ua"), both phones */
 #define HOTTEST_BATTERY_C       45
 
-static const uint8_t writable_regs[] = {
-	FLASH_SAFETY_TIMER0, FLASH_ITARGET0, FLASH_MODULE_EN, FLASH_IRESOLUTION, FLASH_STROBE_CTRL0, FLASH_EN_LED_CTRL,
+/*
+ * The module of each phone (boot-arg board=, which xnuloader passes): redwood's above by default.
+ * A channel's own registers are at the first one's + its number; `channels' are lit together.
+ *
+ * OnePlus 8 (instantnoodle): the PM8150L's "qcom,qpnp-flash-led-v2" (SPMI slave 5, registers 0xd300;
+ * the PM8150L's temperature alarm at 0x2400 of slave 4), Linux drivers/leds/leds-qpnp-flash-v2.c of
+ * OnePlus's kernel: TGR_CURRENT 0x43+n, SAFETY_TMR 0x40+n (0x13: no timer, as its torch nodes have),
+ * STROBE_CTRL 0x49+n ([2] hardware strobe), IRES 0x47 (2 bits a channel, 0: 12.5 mA), MOD_CTRL 0x46,
+ * EN_LED_CTRL 0x4c, LED_STATUS1 0x08 (open/short), LED_STATUS2 0x09 ([2:0] over-temperature, [4]
+ * supply droop). Its torch nodes: 300 mA each by Android's tree (max 500); the flashlight is its
+ * led:switch_2, both channels (the white and the amber LED). Here at most 125 mA each.
+ */
+static struct {
+	const char *module, *alarm_name;
+	uint16_t id, alarm_id;
+	uint8_t type, subtype;
+	uint8_t channels;
+	uint8_t itarget, safety, safety_mask, safety_off, strobe, strobe_mask, ires, ires_mask;
+	uint8_t module_en, en_led, status1, status2, status2_bad;
+	uint32_t torch_ma;              /* per channel; Android's flashlight on redwood */
+} hw = {
+	"the PM8350C's flash LED module", "the PM8350C's temperature alarm", 0x2ee, 0x20a, 0x18, 0x07, 0x01,
+	FLASH_ITARGET0, FLASH_SAFETY_TIMER0, 0x80, 0x00, FLASH_STROBE_CTRL0, 0x74, FLASH_IRESOLUTION, 0x01,
+	FLASH_MODULE_EN, FLASH_EN_LED_CTRL, FLASH_STATUS1, FLASH_STATUS2, STATUS2_OTST1 | STATUS2_OTST2 | STATUS2_VPH_LOW, 125,
 };
+
+static void
+hw_for_board(void)
+{
+	if (!instantnoodle_board()) {
+		return;
+	}
+	hw.module = "the PM8150L's flash LED module";
+	hw.alarm_name = "the PM8150L's temperature alarm";
+	hw.id = 0x5d3;
+	hw.alarm_id = 0x424;
+	hw.subtype = 0x04;              /* what the phone's says (torch=1) */
+	hw.channels = 0x03;
+	hw.itarget = 0x43;
+	hw.safety = 0x40;
+	hw.safety_mask = 0xff;
+	hw.safety_off = 0x13;
+	hw.strobe = 0x49;
+	hw.strobe_mask = 0x04;
+	hw.ires = 0x47;
+	hw.ires_mask = 0x0f;
+	hw.en_led = 0x4c;
+	hw.status1 = 0x08;
+	hw.status2 = 0x09;
+	hw.status2_bad = 0x17;
+	hw.torch_ma = 125;
+}
+
+#define TORCH_CODE(ma)          (((ma) * 1000 + IRES_UA / 2) / IRES_UA - 1)
+
+/* the registers that may be written, for `put': the module's own above, for every channel lit */
+static bool
+writable(uint8_t reg)
+{
+	if (reg == hw.module_en || reg == hw.en_led || reg == hw.ires) {
+		return true;
+	}
+	for (unsigned n = 0; n < 8; n++) {
+		if ((hw.channels >> n & 1) && (reg == hw.itarget + n || reg == hw.safety + n || reg == hw.strobe + n)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static void
 give_up(const char *why)
@@ -322,12 +386,9 @@ put(uint8_t reg, uint8_t value)
 {
 	const char *problem;
 	uint8_t back = 0xff;
-	bool allowed = false;
+	bool allowed = writable(reg);
 
-	for (size_t i = 0; i < sizeof(writable_regs); i++) {
-		allowed |= writable_regs[i] == reg;
-	}
-	if (broken || !allowed || !flash.writable || flash.write == 0 || flash.id != 0x2ee) {
+	if (broken || !allowed || !flash.writable || flash.write == 0 || flash.id != hw.id) {
 		give_up(allowed ? "a write that may not be made" : "a register that is not to be written");
 		return false;
 	}
@@ -436,12 +497,12 @@ trouble(void)
 	static char why[180];
 	uint8_t rt = 0, status1 = 0, status2 = 0, alarm_status = 0, stage;
 
-	if (!get(&flash, FLASH_INT_RT_STS, &rt) || !get(&flash, FLASH_STATUS1, &status1) ||
-	    !get(&flash, FLASH_STATUS2, &status2) || (alarm.found && !get(&alarm, ALARM_STATUS, &alarm_status))) {
+	if (!get(&flash, FLASH_INT_RT_STS, &rt) || !get(&flash, hw.status1, &status1) ||
+	    !get(&flash, hw.status2, &status2) || (alarm.found && !get(&alarm, ALARM_STATUS, &alarm_status))) {
 		return "a read of the flags that failed";
 	}
 	stage = alarm_subtype == 0x08 ? alarm_status & 0x03 : (alarm_status >> 4) & 0x07;
-	if ((rt & RT_STS_FAULT) || status1 != 0 || (status2 & (STATUS2_OTST1 | STATUS2_OTST2 | STATUS2_VPH_LOW)) || stage != 0) {
+	if ((rt & RT_STS_FAULT) || status1 != 0 || (status2 & hw.status2_bad) || stage != 0) {
 		uint8_t more[8] = { 0 }, latched[2] = { 0 };
 
 		(void)spmi_read(&flash, 0x06, more, 8);
@@ -460,13 +521,19 @@ trouble(void)
 
 static bool configured, lit;
 
-/* Android's probe, once: channel 0 strobed by software, its safety timer off. */
+/* Android's probe, once: the channels strobed by software, their safety timers off. */
 static bool
 configure(void)
 {
-	if (!configured && put_bits(FLASH_STROBE_CTRL0, 0x74, 0x00) && put_bits(FLASH_SAFETY_TIMER0, 0x80, 0x00)) {
-		configured = true;
+	bool ok = true;
+
+	for (unsigned n = 0; n < 8 && !configured && ok; n++) {
+		if (hw.channels >> n & 1) {
+			ok = put_bits((uint8_t)(hw.strobe + n), hw.strobe_mask, 0x00) &&
+			    put_bits((uint8_t)(hw.safety + n), hw.safety_mask, hw.safety_off);
+		}
 	}
+	configured = configured || ok;
 	return configured;
 }
 
@@ -474,25 +541,30 @@ configure(void)
 static bool
 light(uint32_t permille)
 {
-	uint32_t ua = ANDROID_TORCH_MA * 1000 * permille / 1000, code;
+	uint32_t ua = hw.torch_ma * 1000 * permille / 1000, code;
 	const char *why;
+	bool ok;
 
 	if (ua < IRES_UA) {
 		ua = IRES_UA;           /* (the driver's least: one step) */
 	}
 	code = (ua + IRES_UA / 2) / IRES_UA - 1;
-	if (code > ANDROID_ITARGET) {
-		code = ANDROID_ITARGET;
+	if (code > TORCH_CODE(hw.torch_ma)) {
+		code = TORCH_CODE(hw.torch_ma);
 	}
 	if (!lit && (why = trouble()) != NULL) {
 		note("not lit: %s", why);
 		give_up("trouble before the light");
 		return false;
 	}
-	if (!configure() || !put_bits(FLASH_IRESOLUTION, 0x01, 0x00) || !put_bits(FLASH_ITARGET0, 0x7f, (uint8_t)code)) {
+	ok = configure() && put_bits(hw.ires, hw.ires_mask, 0x00);
+	for (unsigned n = 0; n < 8 && ok; n++) {
+		ok = !(hw.channels >> n & 1) || put_bits((uint8_t)(hw.itarget + n), 0x7f, (uint8_t)code);
+	}
+	if (!ok) {
 		return false;
 	}
-	if (!lit && (!put(FLASH_MODULE_EN, 0x80) || !put_bits(FLASH_EN_LED_CTRL, 0x01, 0x01))) {
+	if (!lit && (!put(hw.module_en, 0x80) || !put_bits(hw.en_led, hw.channels, hw.channels))) {
 		return false;
 	}
 	lit = true;
@@ -503,8 +575,12 @@ light(uint32_t permille)
 static bool
 dark(void)
 {
-	bool ok = put_bits(FLASH_EN_LED_CTRL, 0x01, 0x00) && put(FLASH_MODULE_EN, 0x00) && put_bits(FLASH_ITARGET0, 0x7f, 0x00) &&
-	    put_bits(FLASH_SAFETY_TIMER0, 0x80, 0x00);
+	bool ok = put_bits(hw.en_led, hw.channels, 0x00) && put(hw.module_en, 0x00);
+
+	for (unsigned n = 0; n < 8 && ok; n++) {
+		ok = !(hw.channels >> n & 1) || (put_bits((uint8_t)(hw.itarget + n), 0x7f, 0x00) &&
+		    put_bits((uint8_t)(hw.safety + n), hw.safety_mask, hw.safety_off));
+	}
 
 	lit = !ok && lit;
 	return ok;
@@ -576,8 +652,8 @@ serve(void)
 		say("torch: /dev/redwood-torch cannot be made\n");
 		return;
 	}
-	say("torch: THE LIGHT IS IOS'S (/dev/redwood-torch) from here on, until the run ends: at most Android's %u mA, at most %u s "
-	    "at a time\n", ANDROID_TORCH_MA, max_secs);
+	say("torch: THE LIGHT IS IOS'S (/dev/redwood-torch) from here on, until the run ends: at most %u mA a channel (channels %#x), "
+	    "at most %u s at a time\n", hw.torch_ma, hw.channels, max_secs);
 	while (!broken) {
 		uint32_t want = wanted;
 		uint64_t now = now_ms();
@@ -644,6 +720,11 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t version, channels;
 	uint8_t id[2] = { 0, 0 }, revision = 0, alarm_status = 0;
 
+	hw_for_board();
+	flash.name = hw.module;
+	flash.id = hw.id;
+	alarm.name = hw.alarm_name;
+	alarm.id = hw.alarm_id;
 	say("torch: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the light on once" :
 	    "the light for iOS");
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
@@ -665,7 +746,7 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 		goto out;
 	}
 	say("torch: the module says type %#x, subtype %#x, revision %#x%s\n", id[0], id[1], revision,
-	    id[0] == 0x18 && id[1] == 0x07 ? ": a flash LED module of four channels, as Android's driver expects" : ": NOT WHAT WAS EXPECTED");
+	    id[0] == hw.type && id[1] == hw.subtype ? ": the flash LED module Android's driver expects" : ": NOT WHAT WAS EXPECTED");
 	show_registers();
 	if (alarm.found && get(&alarm, ALARM_SUBTYPE, &alarm_subtype) && get(&alarm, ALARM_STATUS, &alarm_status)) {
 		uint8_t stage = alarm_subtype == 0x08 ? alarm_status & 0x03 : (alarm_status >> 4) & 0x07;
@@ -675,7 +756,7 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 	} else {
 		alarm.found = false;
 	}
-	if (id[0] != 0x18 || id[1] != 0x07 || level < 2) {
+	if (id[0] != hw.type || id[1] != hw.subtype || level < 2) {
 		goto out;
 	}
 	if (!flash.writable) {
@@ -692,17 +773,17 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 
 		PE_parse_boot_argn("torch_secs", &secs, sizeof(secs));
 		secs = secs < 1 ? 1 : secs > max_secs ? max_secs : secs;
-		say("torch: the light ON at Android's %u mA (ITARGET %u, 12.5 mA steps) for %u s\n", ANDROID_TORCH_MA, ANDROID_ITARGET,
-		    secs);
+		say("torch: the light ON at %u mA a channel (channels %#x, target %u, 12.5 mA steps) for %u s\n", hw.torch_ma,
+		    hw.channels, TORCH_CODE(hw.torch_ma), secs);
 		if (light(1000)) {
 			uint8_t rt = 0, s1 = 0, s2 = 0;
 
 			wait_ms(50);
 			(void)get(&flash, FLASH_INT_RT_STS, &rt);
-			(void)get(&flash, FLASH_STATUS1, &s1);
-			(void)get(&flash, FLASH_STATUS2, &s2);
-			note("lit at Android's %u mA; 50 ms on: interrupt status %#x (%s), channels %#x, temperature and supply %#x",
-			    ANDROID_TORCH_MA, rt, (rt & 0x10) ? "ramped up" : "NOT ramped up", s1, s2);
+			(void)get(&flash, hw.status1, &s1);
+			(void)get(&flash, hw.status2, &s2);
+			note("lit at %u mA a channel; 50 ms on: interrupt status %#x (%s), channels %#x, temperature and supply %#x",
+			    hw.torch_ma, rt, (rt & 0x10) ? "ramped up" : "NOT ramped up", s1, s2);
 			show_registers();
 			for (until = now_ms() + secs * 1000ull; now_ms() < until && (why = trouble()) == NULL;) {
 				wait_ms(100);
@@ -755,9 +836,9 @@ redwood_torch_quiesce(void)
 	for (unsigned i = noted > NOTES ? noted - NOTES : 0; i < noted; i++) {
 		say("torch:   %s\n", notes[i % NOTES]);
 	}
-	(void)spmi_read(&flash, FLASH_MODULE_EN, &module, 1);
-	(void)spmi_read(&flash, FLASH_EN_LED_CTRL, &channels, 1);
-	(void)spmi_read(&flash, FLASH_ITARGET0, &target, 1);
+	(void)spmi_read(&flash, hw.module_en, &module, 1);
+	(void)spmi_read(&flash, hw.en_led, &channels, 1);
+	(void)spmi_read(&flash, hw.itarget, &target, 1);
 	say("torch: at the run's end the module reads: enable %#04x, channels %#04x, target %#04x%s\n", module, channels, target,
-	    module == 0 && (channels & 0x01) == 0 && target == 0 ? " (dark)" : " (NOT DARK)");
+	    module == 0 && (channels & hw.channels) == 0 && target == 0 ? " (dark)" : " (NOT DARK)");
 }

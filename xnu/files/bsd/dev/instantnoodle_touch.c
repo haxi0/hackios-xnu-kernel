@@ -4,7 +4,7 @@
  * On with boot-arg board=instantnoodle (xnuloader passes it); touchscreen=0 turns it off.
  *
  * Its bus is serial engine 13 (i2c@a94000, pins gpio36/gpio37 with external pull-ups); this
- * driver does not use the engine but drives the two pins itself (open drain: low = output 0,
+ * driver does not use the engine but drives the two pins (instantnoodle_i2c.c; open drain: low = output 0,
  * high = input), as ios-instantnoodle and ios-guacamole (OnePlus 7 Pro, same chip) did: the
  * engine's FIFO path is disabled on these phones and would need GPI DMA. Reset is gpio38, the
  * report line gpio39 (unused: polled every 10 ms). Supplies, from the phone's device tree: the
@@ -25,6 +25,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
+#include <sys/instantnoodle.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 
@@ -33,7 +34,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 void instantnoodle_touch_init(void);
 
-static vm_offset_t tlmm, rsc, cmd_db;
+static vm_offset_t rsc, cmd_db;
 
 static inline uint32_t
 rd(vm_offset_t address)
@@ -60,195 +61,25 @@ sleep_ms(uint32_t ms)
 	delay_for_interval(ms, NSEC_PER_MSEC);
 }
 
-/* ---- pins (TLMM, SOUTH tile) --------------------------------------------------------------------- */
+/* ---- pins (TLMM, SOUTH tile) and the bus (sys/instantnoodle.h) -------------------------------- */
 
-#define TLMM_SOUTH_PHYS         0x0f500000UL
-#define TLMM_SIZE               0x100000UL
-#define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
-#define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
-#define PULL_NONE               0
-#define PULL_UP                 3
-#define PIN_SDA                 36
-#define PIN_SCL                 37
-#define PIN_RESET               38
-#define PIN_IRQ                 39
-
-static void
-gpio_configure(unsigned pin, unsigned pull, unsigned ma, bool output)
-{
-	wr(GPIO_CFG(pin), pull | 0u << 2 | (ma / 2 - 1) << 6 | (output ? 1u << 9 : 0));
-}
-
-static void
-gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
-{
-	wr(GPIO_IO(pin), high ? 2 : 0);         /* the level first, so that the pin never drives the wrong one */
-	gpio_configure(pin, pull, ma, true);
-}
-
-/* Open drain: "low" drives 0, "high" lets go (input; the external pull-up makes the level). */
-static void
-line(unsigned pin, bool high)
-{
-	if (high) {
-		gpio_configure(pin, PULL_NONE, 2, false);
-	} else {
-		wr(GPIO_IO(pin), 0);
-		gpio_configure(pin, PULL_NONE, 2, true);
-	}
-}
-
-static bool
-level(unsigned pin)
-{
-	return rd(GPIO_IO(pin)) & 1;
-}
-
-/* ---- I2C on the two pins, about 100 kHz ---------------------------------------------------------- */
-
-static void
-bb_delay(void)
-{
-	delay(4);
-}
-
-static void
-bb_start(void)
-{
-	line(PIN_SDA, true);
-	line(PIN_SCL, true);
-	bb_delay();
-	line(PIN_SDA, false);
-	bb_delay();
-	line(PIN_SCL, false);
-	bb_delay();
-}
-
-static void
-bb_stop(void)
-{
-	line(PIN_SDA, false);
-	bb_delay();
-	line(PIN_SCL, true);
-	bb_delay();
-	line(PIN_SDA, true);
-	bb_delay();
-}
-
-static void
-bb_tx(uint8_t b)
-{
-	for (int i = 7; i >= 0; i--) {
-		line(PIN_SDA, (b >> i) & 1);
-		bb_delay();
-		line(PIN_SCL, true);
-		bb_delay();
-		line(PIN_SCL, false);
-		bb_delay();
-	}
-}
-
-/* 0 when the target pulled SDA low for the byte just sent */
-static int
-bb_ack(void)
-{
-	int nack;
-
-	line(PIN_SDA, true);
-	bb_delay();
-	line(PIN_SCL, true);
-	bb_delay();
-	nack = level(PIN_SDA);
-	line(PIN_SCL, false);
-	bb_delay();
-	return nack ? ENXIO : 0;
-}
-
-static uint8_t
-bb_rx(bool ack)
-{
-	uint8_t v = 0;
-
-	line(PIN_SDA, true);
-	for (int i = 7; i >= 0; i--) {
-		bb_delay();
-		line(PIN_SCL, true);
-		bb_delay();
-		v = (uint8_t)(v << 1 | level(PIN_SDA));
-		line(PIN_SCL, false);
-	}
-	line(PIN_SDA, !ack);
-	bb_delay();
-	line(PIN_SCL, true);
-	bb_delay();
-	line(PIN_SCL, false);
-	line(PIN_SDA, true);
-	bb_delay();
-	return v;
-}
-
-/* nine clocks, so that a target holding SDA low lets go */
-static void
-bb_recover(void)
-{
-	line(PIN_SDA, true);
-	for (int i = 0; i < 9; i++) {
-		line(PIN_SCL, false);
-		bb_delay();
-		line(PIN_SCL, true);
-		bb_delay();
-	}
-	bb_stop();
-}
-
+#define PIN(n)                  ((struct instantnoodle_pin){ INSTANTNOODLE_TLMM_SOUTH, (n) })
+#define PIN_RESET               PIN(38)
+#define PIN_IRQ                 PIN(39)
 #define TS_ADDR                 0x48
 
-static unsigned i2c_errors;
+static struct instantnoodle_i2c bus = { .name = "se13", .sda = PIN(36), .scl = PIN(37) };
 
 static int
 ts_write(const uint8_t *tx, unsigned n)
 {
-	int err;
-
-	bb_start();
-	bb_tx(TS_ADDR << 1);
-	err = bb_ack();
-	for (unsigned i = 0; i < n && err == 0; i++) {
-		bb_tx(tx[i]);
-		err = bb_ack();
-	}
-	bb_stop();
-	if (err) {
-		i2c_errors++;
-	}
-	return err;
+	return instantnoodle_i2c_write(&bus, TS_ADDR, tx, n);
 }
 
 static int
 ts_read(uint8_t reg, uint8_t *buf, unsigned n)
 {
-	int err;
-
-	bb_start();
-	bb_tx(TS_ADDR << 1);
-	err = bb_ack();
-	if (err == 0) {
-		bb_tx(reg);
-		err = bb_ack();
-	}
-	if (err == 0) {
-		bb_start();                     /* repeated start */
-		bb_tx(TS_ADDR << 1 | 1);
-		err = bb_ack();
-	}
-	for (unsigned i = 0; i < n && err == 0; i++) {
-		buf[i] = bb_rx(i + 1 < n);
-	}
-	bb_stop();
-	if (err) {
-		i2c_errors++;
-	}
-	return err;
+	return instantnoodle_i2c_read(&bus, TS_ADDR, reg, buf, n);
 }
 
 /* ---- the supplies (RPMh), as bsd/dev/redwood_goodix.c --------------------------------------------- */
@@ -517,24 +348,23 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 	uint8_t id[3] = { 0, 0, 0 }, boot = 0, fw = 0, func[3] = { CMD_TOUCH_FUNC, MASK_TOUCH, 0 }, sense = CMD_SENSE_ON;
 	unsigned errors = 0;
 
-	tlmm = ml_io_map(TLMM_SOUTH_PHYS, TLMM_SIZE);
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);    /* memory, not registers */
-	printf("touch: S6SY761: pins sda %u scl %u reset %u irq %u: cfg %#x %#x %#x %#x\n", PIN_SDA, PIN_SCL, PIN_RESET,
-	    PIN_IRQ, rd(GPIO_CFG(PIN_SDA)), rd(GPIO_CFG(PIN_SCL)), rd(GPIO_CFG(PIN_RESET)), rd(GPIO_CFG(PIN_IRQ)));
+	printf("touch: S6SY761: pins sda %u scl %u reset %u irq %u: cfg %#x %#x %#x %#x\n", bus.sda.pin, bus.scl.pin,
+	    PIN_RESET.pin, PIN_IRQ.pin, instantnoodle_gpio_cfg(bus.sda), instantnoodle_gpio_cfg(bus.scl),
+	    instantnoodle_gpio_cfg(PIN_RESET), instantnoodle_gpio_cfg(PIN_IRQ));
 
-	line(PIN_SDA, true);
-	line(PIN_SCL, true);
-	gpio_configure(PIN_IRQ, PULL_NONE, 2, false);
-	gpio_output(PIN_RESET, false, PULL_UP, 8);     /* in reset while the supplies come up */
+	instantnoodle_i2c_recover(&bus);                /* both lines let go */
+	instantnoodle_gpio_input(PIN_IRQ, INSTANTNOODLE_PULL_NONE);
+	instantnoodle_gpio_output(PIN_RESET, false, INSTANTNOODLE_PULL_UP, 8);  /* in reset while the supplies come up */
 	if (!supply_on("ldoc1", 1800) || (sleep_ms(1), !supply_on("ldoa13", 3008))) {
 		printf("touch: no supplies: no touch screen\n");
 		goto out;
 	}
 	sleep_ms(20);
-	gpio_output(PIN_RESET, true, PULL_UP, 8);
+	instantnoodle_gpio_output(PIN_RESET, true, INSTANTNOODLE_PULL_UP, 8);
 	sleep_ms(140);                                  /* Linux s6sy761: power-on wait */
-	bb_recover();
+	instantnoodle_i2c_recover(&bus);
 
 	printf("touch: boot-complete event: %s\n", wait_boot_complete() == 0 ? "seen" : "NOT SEEN (going on)");
 	if (ts_read(CMD_DEVICE_ID, id, 3) != 0) {
@@ -554,13 +384,13 @@ touch_thread(void *parameter __unused, wait_result_t result __unused)
 		if (poll_events() != 0) {
 			if (++errors == 10) {
 				release_all();
-				bb_recover();
+				instantnoodle_i2c_recover(&bus);
 			}
 		} else {
 			errors = 0;
 		}
 		if (tick % 6000 == 0) {                 /* once a minute */
-			printf("touch: %u events, %u bus errors so far\n", events, i2c_errors);
+			printf("touch: %u events, %u bus errors so far\n", events, bus.errors);
 		}
 		sleep_ms(10);
 	}
@@ -571,11 +401,10 @@ out:
 void
 instantnoodle_touch_init(void)
 {
-	char board[32] = "";
 	uint32_t enabled = 1;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("board", board, sizeof(board)) || strcmp(board, "instantnoodle") != 0) {
+	if (!instantnoodle_board()) {
 		return;
 	}
 	PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled));

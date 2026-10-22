@@ -9,6 +9,7 @@
 #include <sys/conf.h>
 #include <sys/errno.h>
 #include <sys/proc.h>
+#include <sys/instantnoodle.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
@@ -220,6 +221,7 @@ redwood_input_init(void)
 	instantnoodle_touch_init();     /* the OnePlus 8's S6SY761 (board=instantnoodle) */
 	redwood_buttons_init();
 	redwood_battery_init();
+	instantnoodle_battery_init();   /* the OnePlus 8's bq27541 (board=instantnoodle) */
 	redwood_ufs_init();
 	redwood_net_init();
 	redwood_adreno_init();
